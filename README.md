@@ -118,6 +118,15 @@ Meta hardware, drop the `meta_company_id`/`meta_service_uuid`/`legacy_oui` branc
 Meta ships new glasses hardware occasionally, which could mean new company IDs or service UUIDs — extend the
 checks in the same lambda if one turns up.
 
+**Live-verified against a real Meta Quest 3**: powering on a Quest 3 near the board produced a steady stream of
+`match=meta_company_id` detections (advertised name `"Quest 3"`, RSSI -35 to -48 at close range), correctly
+tripping `binary_sensor.meta_glasses_detected` while `binary_sensor.glasses_high_confidence` stayed off the
+entire time — confirming the Luxottica/name discriminator works as intended. This also answers a question the
+BLE spec left open going in: a Quest 3 broadcasts a general discoverable BLE presence just from being powered
+on, not only during controller pairing — its advertised MAC's top bits (`0111...`) confirm it's a resolvable
+private address, i.e. the same address-randomization behavior that makes OUI matching unreliable for Meta
+hardware generally, not just the glasses.
+
 ## Notes on the port
 
 - The original sketch's `BLEScan::setInterval(100)` / `setWindow(80)` are in 0.625ms BLE units (~62.5ms /
