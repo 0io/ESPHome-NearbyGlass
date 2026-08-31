@@ -9,11 +9,15 @@ WireGuard tunnel, and logs every detection.
 
 ## What it does
 
-- **Detection**: matches BLE advertisement MAC addresses against known Meta/Facebook OUI prefixes
-  (`7c:2a:9e`, `cc:66:0a`, `f4:03:43`, `5c:e9:1e`), and falls back to matching "Ray-Ban" or "Meta" in the
-  advertised device name. Same logic as the original Arduino sketch.
-- **`binary_sensor.meta_glasses_detected`**: exposed to Home Assistant, occupancy class, auto-clears 10s after
-  the last matching advertisement.
+- **Detection**: layered signals, not raw OUI matching (see [Detection design](#detection-design) below for why).
+  Broad ("any Meta device") and high-confidence ("Ray-Ban Meta glasses specifically") signals are tracked
+  separately.
+- **`binary_sensor.meta_glasses_detected`**: broad/over-inclusive — any Meta signal at all. Exposed to Home
+  Assistant, occupancy class, auto-clears 10s after the last matching advertisement. **Will also fire for Quest
+  headsets/controllers**, not just glasses.
+- **`binary_sensor.glasses_high_confidence`** ("Ray-Ban Meta Glasses Detected (high confidence)"): the
+  Luxottica-company-ID + Meta-service-UUID composite signal, or a glasses-specific name match. Shouldn't fire
+  for Quest.
 - **`text_sensor.detection_log`**: publishes a new timestamped record (`epoch mac=... name="..." rssi=... match=...`)
   for every detection. Home Assistant's logbook/history for this entity *is* the persistent detection log — no
   external server required.
@@ -77,10 +81,42 @@ this target, unlike some other ESP32 variants, so don't add one.
 3. Once online, the device exposes all sensors/lights to Home Assistant via the native API — no YAML integration
    needed.
 
-## Extending the OUI list
+## Detection design
 
-Meta ships new glasses hardware occasionally, which can mean new MAC prefixes. Add them to the `meta_prefixes`
-array in the `esp32_ble_tracker.on_ble_advertise` lambda in `glasshole.yaml`.
+Ray-Ban Meta glasses advertise over BLE using a **random address** (resolvable/static-random, per the Bluetooth
+Core spec) that rotates — not a fixed factory MAC drawn from a stable IEEE OUI block. That makes raw MAC-prefix
+matching fundamentally unreliable for this hardware, which is also why the original `glass-detect` sketch's 4
+hardcoded prefixes (`7c:2a:9e`, `cc:66:0a`, `f4:03:43`, `5c:e9:1e`) don't hold up: looked up against the current
+IEEE OUI registry, `cc:66:0a` and `5c:e9:1e` belong to **Apple, Inc.**, `f4:03:43` to **Hewlett Packard
+Enterprise**, and `7c:2a:9e` isn't assigned to anyone. Their top bits also match the BLE spec's
+random-address-type encoding, not real vendor-assigned OUI bits — strongly suggesting the original author
+captured real glasses traffic but mislabeled random-address bytes as vendor MACs. Every other actively
+maintained smart-glasses BLE detector project independently reached the same conclusion and abandoned
+OUI-based matching:
+[colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue),
+[NullPxl/banrays](https://github.com/NullPxl/banrays),
+[yjeanrenaud/yj_nearbyglasses](https://github.com/yjeanrenaud/yj_nearbyglasses).
+
+So this config matches on BLE advertisement content instead, layered weakest to strongest (all tagged in
+`detection_log`'s `match=` field so you can tell which fired):
+
+1. `legacy_oui` — the 4 original prefixes, kept only as a low-confidence legacy fallback per the above.
+2. `meta_company_id` — BLE manufacturer-data Company ID `0x01AB` (Meta Platforms) or `0x058E` (Meta Platforms
+   Technologies). Real signal, but shared across **all** Meta hardware including Quest headsets/controllers.
+3. `meta_service_uuid` — Meta's assigned 16-bit service UUID `0xFD5F`. Also shared across Meta products.
+4. `glasses_luxottica` — Luxottica's Company ID `0x0D53` (the frame manufacturer) *together with* the Meta
+   service UUID. High confidence, glasses-specific — this is the composite every independently-maintained
+   project above converged on.
+5. `glasses_name` — "Ray-Ban" / "Wayfarer" / "Oakley Meta" in the advertised name. Deliberately excludes a bare
+   "Meta" match so a Quest advertising a "Meta Quest ..." name doesn't count as high-confidence glasses.
+
+`binary_sensor.meta_glasses_detected` fires on *any* of the above (favoring over-alerting); only signals 4-5
+also set `binary_sensor.glasses_high_confidence`. If you want the broad sensor to stop counting Quest/other
+Meta hardware, drop the `meta_company_id`/`meta_service_uuid`/`legacy_oui` branches from the `if` in the
+`on_ble_advertise` lambda in `glasshole.yaml` and key everything off `high_confidence_glasses`.
+
+Meta ships new glasses hardware occasionally, which could mean new company IDs or service UUIDs — extend the
+checks in the same lambda if one turns up.
 
 ## Notes on the port
 
