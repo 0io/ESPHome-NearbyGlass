@@ -1,0 +1,225 @@
+esphome:
+  name: glasshole-eth
+  friendly_name: GlassHole Detector (Ethernet)
+  on_boot:
+    priority: -100
+    then:
+      - repeat:
+          count: 2
+          then:
+            - light.turn_on: glasshole_led
+            - delay: 250ms
+            - light.turn_off: glasshole_led
+            - delay: 250ms
+
+# Generic ESP32-S3R8 Ethernet/PoE board (UeeKKoo-branded, same reference design sold under
+# several names - W5500 SPI Ethernet, optional PoE module, unused OV2640/OV5640 camera header,
+# unused TF card slot). ESP-IDF framework for consistency with the W5500 driver and wireguard.
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Time source required by the wireguard component, and used to timestamp detection log entries.
+time:
+  - platform: sntp
+    id: sntp_time
+
+# Deliberately no wifi: component at all. Networking is entirely over the wired W5500
+# Ethernet link below (with PoE for power) - see the "100% BLE scan time" note on
+# esp32_ble_tracker for why dropping wifi is what actually buys back scan duty cycle,
+# not just the board swap.
+ethernet:
+  type: W5500
+  clk_pin: GPIO13
+  mosi_pin: GPIO11
+  miso_pin: GPIO12
+  cs_pin: GPIO14
+  interrupt_pin: GPIO10
+  reset_pin: GPIO9
+  clock_speed: 25MHz
+
+# Reaches the Home Assistant / ESPHome API over a VPN tunnel when this device's Ethernet
+# segment isn't the same network as the ESPHome dashboard/HA instance. require_connection_to_proceed
+# defaults to false so boot never blocks on the tunnel coming up.
+wireguard:
+  id: glasshole_wireguard
+  address: !secret wireguard_address
+  private_key: !secret wireguard_private_key
+  peer_endpoint: !secret wireguard_peer_endpoint
+  peer_public_key: !secret wireguard_peer_public_key
+
+# 100% BLE scan time: ESPHome only compiles in the wifi/BLE radio-coexistence arbiter when a
+# wifi: component is configured (esp32_ble_tracker's software_coexistence flag). With no wifi:
+# here at all, BLE owns the 2.4GHz radio outright - no time-sharing negotiation with anything.
+# Setting window equal to interval then closes the only other gap: BLE's own scan duty cycle,
+# which otherwise idles between scan windows even with the radio uncontested. Together that's
+# genuinely continuous (~100% duty cycle) active scanning, not just "no wifi to fight with".
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 320ms
+    window: 320ms
+    active: true
+  on_ble_advertise:
+    then:
+      - lambda: |-
+          // Detection signals, weakest to strongest. Ray-Ban Meta glasses advertise with a
+          // BLE random address (RPA/static-random) that rotates, NOT a fixed factory MAC, so
+          // raw OUI/MAC-prefix matching is close to useless for them - see README for the
+          // full writeup and links to the independent projects this is cross-checked against
+          // (colonelpanichacks/oui-spy-unified-blue, NullPxl/banrays, yjeanrenaud/yj_nearbyglasses).
+          //
+          // 1. legacy_oui: the 4 prefixes from the original sh4d0wm45k/glass-detect sketch this
+          //    was ported from. IEEE-registry lookups show these actually belong to Apple/HPE,
+          //    not Meta, and their bit patterns match BLE random-address encoding - almost
+          //    certainly captured RPA bytes from real glasses, not real vendor OUIs. Kept only
+          //    as a low-confidence legacy fallback signal, tagged so it's easy to drop later.
+          // 2. meta_company_id: BLE manufacturer-data Company ID 0x01AB (Meta Platforms) or
+          //    0x058E (Meta Platforms Technologies) present in the advertisement. Real signal,
+          //    but shared across ALL Meta hardware including Quest headsets/controllers - not
+          //    glasses-specific. Live-verified against a real Quest 3 (see README).
+          // 3. meta_service_uuid: Meta's assigned 16-bit service UUID 0xFD5F advertised, again
+          //    shared across Meta products.
+          // 4. glasses_luxottica: Luxottica's manufacturer Company ID 0x0D53 (the frame maker)
+          //    together with the Meta service UUID - the composite signal every actively
+          //    maintained glasses-detector project converged on. High confidence, glasses-only.
+          // 5. name_match: "Ray-Ban" / "Wayfarer" / "Oakley Meta" in the advertised name -
+          //    glasses-specific; deliberately excludes a bare "Meta" match so Quest devices
+          //    that advertise a "Meta Quest ..." name don't count as high-confidence glasses.
+          static const char *legacy_oui_prefixes[] = {
+              "7c:2a:9e",
+              "cc:66:0a",
+              "f4:03:43",
+              "5c:e9:1e",
+          };
+
+          std::string mac = x.address_str();
+          std::transform(mac.begin(), mac.end(), mac.begin(), ::tolower);
+          std::string name = x.get_name();
+
+          bool legacy_oui_match = false;
+          for (auto prefix : legacy_oui_prefixes) {
+            if (mac.rfind(prefix, 0) == 0) {
+              legacy_oui_match = true;
+              break;
+            }
+          }
+
+          bool meta_company_id = false;
+          bool luxottica_company_id = false;
+          for (auto &md : x.get_manufacturer_datas()) {
+            if (md.uuid.contains(0xAB, 0x01) || md.uuid.contains(0x8E, 0x05))
+              meta_company_id = true;
+            if (md.uuid.contains(0x53, 0x0D))
+              luxottica_company_id = true;
+          }
+
+          bool meta_service_uuid = false;
+          for (auto &uuid : x.get_service_uuids()) {
+            if (uuid.contains(0x5F, 0xFD))
+              meta_service_uuid = true;
+          }
+          for (auto &sd : x.get_service_datas()) {
+            if (sd.uuid.contains(0x5F, 0xFD))
+              meta_service_uuid = true;
+          }
+
+          bool glasses_name_match = name.find("Ray-Ban") != std::string::npos ||
+                                     name.find("Wayfarer") != std::string::npos ||
+                                     name.find("Oakley Meta") != std::string::npos;
+
+          bool high_confidence_glasses = (luxottica_company_id && meta_service_uuid) || glasses_name_match;
+          bool any_meta_signal = high_confidence_glasses || meta_company_id || meta_service_uuid || legacy_oui_match;
+
+          if (any_meta_signal) {
+            const char *match_type = high_confidence_glasses
+                                          ? (glasses_name_match ? "glasses_name" : "glasses_luxottica")
+                                          : (meta_company_id
+                                                 ? "meta_company_id"
+                                                 : (meta_service_uuid ? "meta_service_uuid" : "legacy_oui"));
+
+            char log_line[160];
+            time_t now = id(sntp_time).now().timestamp;
+            snprintf(log_line, sizeof(log_line), "%lld mac=%s name=\"%s\" rssi=%d match=%s",
+                     (long long) now, mac.c_str(), name.c_str(), x.get_rssi(), match_type);
+
+            ESP_LOGW("glasshole", "Meta device detected: %s", log_line);
+            id(glasshole_detected).publish_state(true);
+            id(last_glasshole_mac).publish_state(mac);
+            id(detection_log).publish_state(log_line);
+            id(glasshole_flash).execute();
+
+            if (high_confidence_glasses)
+              id(glasses_high_confidence).publish_state(true);
+          }
+
+binary_sensor:
+  # Broad/over-inclusive: any Meta signal at all (company ID, service UUID, legacy OUI, or
+  # glasses name match). Will also fire for Quest headsets/controllers - see README.
+  - platform: template
+    name: "Meta Device Detected"
+    id: glasshole_detected
+    device_class: occupancy
+    filters:
+      - delayed_off: 10s
+  # Narrow/high-confidence: Luxottica company ID + Meta service UUID together, or a
+  # glasses-specific name match. Shouldn't fire for Quest headsets.
+  - platform: template
+    name: "Ray-Ban Meta Glasses Detected (high confidence)"
+    id: glasses_high_confidence
+    device_class: occupancy
+    filters:
+      - delayed_off: 10s
+  - platform: template
+    name: "WireGuard Connected"
+    id: wireguard_connected
+    device_class: connectivity
+    lambda: return id(glasshole_wireguard).is_peer_up();
+
+text_sensor:
+  - platform: template
+    name: "Last Detected Glasses MAC"
+    id: last_glasshole_mac
+  # Every published value is a distinct, timestamped detection record; Home Assistant's
+  # logbook/history for this entity is the persistent log of each detection.
+  - platform: template
+    name: "Detection Log"
+    id: detection_log
+
+# External LED sign (the "GLASSHOLE" PCB from the original project). GPIO4 is a header pin
+# not used by the W5500 Ethernet SPI bus (GPIO9/10/11/12/13/14) on this board - verify against
+# your specific board's silkscreen before wiring, since the camera/TF-card header pins are
+# unconfirmed for the UeeKKoo clone and this project doesn't use either, so any pin not
+# claimed by Ethernet above should be free regardless of what else is silkscreened there.
+output:
+  - platform: gpio
+    pin: GPIO4
+    id: glasshole_led_output
+
+light:
+  - platform: binary
+    name: "GlassHole Sign"
+    id: glasshole_led
+    output: glasshole_led_output
+
+script:
+  - id: glasshole_flash
+    mode: restart
+    then:
+      - repeat:
+          count: 4
+          then:
+            - light.turn_on: glasshole_led
+            - delay: 500ms
+            - light.turn_off: glasshole_led
+            - delay: 500ms

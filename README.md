@@ -4,8 +4,15 @@ An ESPHome port of [sh4d0wm45k/glass-detect](https://github.com/sh4d0wm45k/glass
 covered on [Hackaday](https://hackaday.com/2025/12/02/build-your-own-glasshole-detector/)): an ESP32 that scans BLE
 advertisements for Meta Ray-Ban smart glasses and reacts when it finds one nearby.
 
-Targets the **Seeed Studio XIAO ESP32C5**, connects to Home Assistant/ESPHome either directly on the LAN or over a
-WireGuard tunnel, and logs every detection.
+Two hardware targets, two config files, sharing the same detection logic:
+
+- **`glasshole.yaml`** — Seeed Studio XIAO ESP32C5. Wi-Fi (with AP/Improv provisioning) + BLE, connects to Home
+  Assistant/ESPHome either directly on the LAN or over a WireGuard tunnel.
+- **`glasshole-s3-eth.yaml`** — ESP32-S3 with W5500 Ethernet + PoE, no Wi-Fi at all. Networking is entirely wired,
+  which — see [100% BLE scan time](#100-ble-scan-time-ethernet-variant) — is what buys back full BLE scan duty
+  cycle, not just a faster chip.
+
+Both log every detection.
 
 ## What it does
 
@@ -37,6 +44,8 @@ WireGuard tunnel, and logs every detection.
 
 ## Hardware
 
+### XIAO ESP32C5 (`glasshole.yaml`)
+
 **Seeed Studio XIAO ESP32C5** (`seeed_xiao_esp32c5` board, ESP-IDF framework — ESP32-C5 doesn't support Arduino
 in ESPHome). Verified against real hardware:
 - Native USB-Serial/JTAG, enumerates as `/dev/ttyACM0` (Espressif USB JTAG/serial debug unit, `303a:1001`) — no
@@ -56,30 +65,90 @@ the ESP32-C5's `XTAL_FREQ` Kconfig only offers `XTAL_FREQ_AUTO` (value `0`), whi
 chip detects its 40/48MHz crystal itself at boot via efuse bits). There's no `CONFIG_XTAL_FREQ_48` option for
 this target, unlike some other ESP32 variants, so don't add one.
 
+### ESP32-S3 Ethernet/PoE (`glasshole-s3-eth.yaml`)
+
+A generic ESP32-S3R8 Ethernet/PoE dev board — this one's sold as **UeeKKoo**, but it's the same reference design
+sold under several other brand names (Waveshare's `ESP32-S3-ETH` among them): W5500 SPI Ethernet, optional PoE
+module, an unused OV2640/OV5640 camera header, and an unused TF card slot. `esp32.board: esp32-s3-devkitc-1`
+(a generic S3 board id — nothing here depends on this specific brand's board file), ESP-IDF framework.
+
+- Native USB-Serial/JTAG over USB-C, same as the C5 — confirmed via `esptool`: ESP32-S3 (QFN56), 8MB embedded
+  PSRAM, MAC read correctly.
+- W5500 Ethernet pins (this reference design's fixed wiring, not configurable in hardware): `clk_pin: GPIO13`,
+  `mosi_pin: GPIO11`, `miso_pin: GPIO12`, `cs_pin: GPIO14`, `interrupt_pin: GPIO10`, `reset_pin: GPIO9`. Sourced
+  from two independent boards using this same reference design (Waveshare's published pinout and a generic
+  "ESP32-S3-POE-ETH" pin table) that agree exactly — not verified against UeeKKoo's own documentation directly,
+  since none could be found; if Ethernet doesn't link on your board, check its schematic against these pins
+  first.
+- External "GLASSHOLE" LED sign: wire your driver to **GPIO4** — a pin the W5500 SPI bus doesn't use. This
+  board's camera/TF-card header pins aren't independently confirmed, but since this config never initializes a
+  camera or SD card component, any pin not claimed by the `ethernet:` block above is free regardless of what
+  else is silkscreened onto it.
+- No Wi-Fi at all — see [100% BLE scan time](#100-ble-scan-time-ethernet-variant) for why that's deliberate, not
+  just an oversight.
+
+**Verification status**: compiled and flashed to the real board over `/dev/ttyACM0`. `esp32_ble_tracker` confirms
+`Scan Interval: 320.0 ms / Scan Window: 320.0 ms / Continuous Scanning: YES` with no coexistence arbiter — it's
+already detecting real devices nearby (a Quest 3) at a visibly higher rate than the XIAO ESP32C5's `60ms`-in-`100ms`
+window. The W5500 driver initializes cleanly against the pin mapping above with no SPI/comm errors. **Ethernet
+link itself is not yet confirmed** — `ethernet:` reports `Connected: NO` / `Connecting failed; reconnecting` in
+a loop; not yet determined whether that's simply no cable plugged in during this test or a real pin mismatch.
+
 ## Setup
 
 1. Copy `secrets.yaml.example` to `secrets.yaml` and fill in:
-   - Wi-Fi credentials, an OTA password, and a 32-byte base64 API encryption key (generator command is a comment
-     in the file).
-   - WireGuard tunnel config (device address, device private key, peer endpoint, peer public key). Generate a
-     keypair with `wg genkey | tee device.key | wg pubkey > device.pub` and add the device as a peer on your
-     WireGuard server.
-2. Flash over USB:
+   - An OTA password and a 32-byte base64 API encryption key (generator command is a comment in the file) —
+     needed by both variants.
+   - Wi-Fi AP fallback password (`ap_fallback_password`) — XIAO ESP32C5 only; the S3/Ethernet variant has no
+     Wi-Fi and ignores this key.
+   - WireGuard tunnel config (device address, device private key, peer endpoint, peer public key) — needed by
+     both variants. Generate a keypair with `wg genkey | tee device.key | wg pubkey > device.pub` and add the
+     device as a peer on your WireGuard server.
+2. Flash over USB (same command either way, just point it at the right file):
 
    ```
    python3 -m venv .venv && .venv/bin/pip install esphome   # or: uv venv .venv && uv pip install --python .venv/bin/python esphome
-   .venv/bin/esphome run glasshole.yaml
+   .venv/bin/esphome run glasshole.yaml          # XIAO ESP32C5
+   .venv/bin/esphome run glasshole-s3-eth.yaml   # ESP32-S3 Ethernet/PoE
    ```
 
    The device's serial port must be accessible to your user (on Linux, be in the `dialout` group, or
-   `sudo chmod 666 /dev/ttyACM0` for a one-off fix).
+   `sudo chmod 666 /dev/ttyACM0` for a one-off fix — group membership persists across reboots, the chmod
+   doesn't).
 
    On first compile, ESPHome downloads ESP-IDF and creates its own Python virtualenv for it via
    `python -m venv`. If your system Python is missing `ensurepip` (Debian/Ubuntu split it into a separate
    `python3.X-venv` package) and you can't `apt install` it, point `PYTHONEXEPATH` at a small wrapper script
    that runs `uv venv --seed` instead for that one call — `uv` doesn't need `ensurepip`.
 3. Once online, the device exposes all sensors/lights to Home Assistant via the native API — no YAML integration
-   needed.
+   needed. On the XIAO ESP32C5, connect to the "Glasshole Fallback Hotspot" AP first to provision real Wi-Fi
+   credentials (see below); the S3/Ethernet variant just needs a network cable (PoE or DC power).
+
+### Wi-Fi provisioning (XIAO ESP32C5 only)
+
+`glasshole.yaml` has no static `ssid`/`password` on purpose — the device boots straight into the "Glasshole
+Fallback Hotspot" AP every time until provisioned, either via that AP's captive portal or over USB via
+`improv_serial`. Whichever you use, ESPHome saves the submitted credentials to flash and reconnects to that
+network automatically on every later boot; the AP only reappears if that saved network stops being reachable.
+
+## 100% BLE scan time (Ethernet variant)
+
+`glasshole-s3-eth.yaml` has no `wifi:` component at all — Ethernet handles all networking. That's not just
+"one less thing to configure," it's the actual mechanism for getting continuous BLE scanning:
+
+- ESPHome's `esp32_ble_tracker` only compiles in the Wi-Fi/BLE radio-coexistence arbiter when a `wifi:`
+  component is present (`software_coexistence`, set "iff wifi is configured and not disabled by the user" —
+  see the comments above `_raise_defaulted_scan_window` in `esphome/components/esp32_ble_tracker/__init__.py`).
+  With no `wifi:` block, that arbiter isn't compiled in at all — BLE has the 2.4GHz radio to itself, with no
+  time-sharing negotiation with anything.
+- That alone doesn't guarantee continuous scanning, though — `esp32_ble_tracker`'s own `scan_parameters` still
+  has an `interval` (how often a scan window starts) and a `window` (how long it listens), and a window shorter
+  than the interval leaves an idle gap between them regardless of radio contention. Setting `window: 320ms`
+  equal to `interval: 320ms` closes that gap too. Combined, that's genuinely continuous (~100%-duty-cycle)
+  active scanning — the XIAO ESP32C5 variant's `window: 60ms` inside a `100ms` interval is nowhere close.
+
+If you add a `wifi:` component to the Ethernet variant for any reason (e.g. as a secondary network path),
+you'll get the coexistence arbiter back and lose this — Wi-Fi and BLE would go back to sharing the radio.
 
 ## Detection design
 
