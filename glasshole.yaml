@@ -1,0 +1,116 @@
+esphome:
+  name: glasshole
+  friendly_name: GlassHole Detector
+  on_boot:
+    priority: -100
+    then:
+      - repeat:
+          count: 2
+          then:
+            - light.turn_on: glasshole_led
+            - delay: 250ms
+            - light.turn_off: glasshole_led
+            - delay: 250ms
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Glasshole Fallback Hotspot"
+    password: !secret ap_fallback_password
+
+captive_portal:
+
+# Scan parameters mirror the original glass-detect.ino (setInterval(100)/setWindow(80),
+# which are in 0.625ms BLE units -> ~62.5ms interval / ~50ms window).
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 100ms
+    window: 60ms
+    active: true
+  on_ble_advertise:
+    then:
+      - lambda: |-
+          // Meta/Facebook MAC OUI prefixes seen on Ray-Ban Meta smart glasses.
+          // Source: https://github.com/sh4d0wm45k/glass-detect - add more here as they surface.
+          static const char *meta_prefixes[] = {
+              "7c:2a:9e",
+              "cc:66:0a",
+              "f4:03:43",
+              "5c:e9:1e",
+          };
+
+          std::string mac = x.address_str();
+          std::transform(mac.begin(), mac.end(), mac.begin(), ::tolower);
+
+          std::string name = x.get_name();
+
+          bool prefix_match = false;
+          for (auto prefix : meta_prefixes) {
+            if (mac.rfind(prefix, 0) == 0) {
+              prefix_match = true;
+              break;
+            }
+          }
+
+          bool name_match = name.find("Ray-Ban") != std::string::npos ||
+                             name.find("Meta") != std::string::npos;
+
+          if (prefix_match || name_match) {
+            ESP_LOGW("glasshole", "Meta glasses detected: %s \"%s\" (%s)", mac.c_str(),
+                      name.c_str(), prefix_match ? "MAC prefix" : "name match");
+            id(glasshole_detected).publish_state(true);
+            id(last_glasshole_mac).publish_state(mac);
+            id(glasshole_flash).execute();
+          }
+
+binary_sensor:
+  - platform: template
+    name: "Meta Glasses Detected"
+    id: glasshole_detected
+    device_class: occupancy
+    filters:
+      - delayed_off: 10s
+
+text_sensor:
+  - platform: template
+    name: "Last Detected Glasses MAC"
+    id: last_glasshole_mac
+
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: glasshole_led_output
+
+light:
+  - platform: binary
+    name: "GlassHole Sign"
+    id: glasshole_led
+    output: glasshole_led_output
+
+script:
+  - id: glasshole_flash
+    mode: restart
+    then:
+      - repeat:
+          count: 4
+          then:
+            - light.turn_on: glasshole_led
+            - delay: 500ms
+            - light.turn_off: glasshole_led
+            - delay: 500ms
