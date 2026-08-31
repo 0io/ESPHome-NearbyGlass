@@ -36,9 +36,11 @@ time:
   - platform: sntp
     id: sntp_time
 
+# No static ssid/password: the device boots straight into the fallback AP below until
+# provisioned via the captive portal or improv_serial. Once you submit real credentials
+# either way, ESPHome saves them to flash and reconnects to that network automatically
+# on every later boot - the AP only comes back if that saved network stops being reachable.
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
   ap:
     ssid: "Glasshole Fallback Hotspot"
     password: !secret ap_fallback_password
