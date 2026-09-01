@@ -91,8 +91,11 @@ module, an unused OV2640/OV5640 camera header, and an unused TF card slot. `esp3
 `Scan Interval: 320.0 ms / Scan Window: 320.0 ms / Continuous Scanning: YES` with no coexistence arbiter — it's
 already detecting real devices nearby (a Quest 3) at a visibly higher rate than the XIAO ESP32C5's `60ms`-in-`100ms`
 window. The W5500 driver initializes cleanly against the pin mapping above with no SPI/comm errors. **Ethernet
-link itself is not yet confirmed** — `ethernet:` reports `Connected: NO` / `Connecting failed; reconnecting` in
-a loop; not yet determined whether that's simply no cable plugged in during this test or a real pin mismatch.
+link is confirmed working**: with a cable connected and the board powered over PoE, `wireguard:` repeatedly logs
+`Remote peer is online` with a fresh handshake timestamp every ~10s — that traffic can only flow over an
+established, routed Ethernet link, so both the W5500 pin mapping and the wired network path are good on this
+board. (The earlier `Connected: NO` / `Connecting failed; reconnecting` loop during initial bring-up was link-layer,
+not a pin-mapping bug — no cable was plugged in yet at that point.)
 
 ## Setup
 
